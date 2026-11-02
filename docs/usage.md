@@ -1,5 +1,7 @@
 # 第一版使用说明
 
+以下为底层 CLI 调试说明。日常用户直接向 Codex 上传 EPUB，由 Agent 接管流程，见 [Codex Agent](agent.md)。
+
 ## 安装与启动
 
 需要 Python 3.11+，运行时没有第三方 Python 依赖，也不需要 API key。
@@ -100,7 +102,7 @@ ebook-translate build "runs/book" --output "outputs/book.zh.epub"
 ## 第一版边界
 
 - 支持 EPUB 3、可重排 XHTML；拒绝 EPUB 2、固定版式和包含 encryption.xml 的书籍（包括字体混淆）。
-- 不实现扫描页 OCR，不翻译图片内文字；纯图片页必须保留警告。
+- 底层 CLI 不自行调用 OCR。v0.2.0 的 Codex Agent 创建图片任务，交给 Gemini 网页识别和翻译，再由 Codex 对照复核。没有图片任务时仍保留警告。
 - code/pre/math/SVG/注音 rt/rp 保留原内容，含此类内容会产生警告。ruby 原注音可能不再适合中文，需校订。
 - 保留属性值，暂不翻译 alt/title；非空此类文本会产生警告。XHTML head 标题与 EPUB 3 附带的旧式 NCX 不在翻译范围。
 - XML 序列化可能规范化命名空间前缀、引号及空标签写法；这是保留文档结构，不是字节相同或像素级复刻。

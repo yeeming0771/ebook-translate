@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ebook-translate"
-version = "0.1.0"
+version = "0.2.0"
 description = "Resumable EPUB translation with the free Gemini web interface"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 ebook-translate = "ebook_translate.cli:main"
+ebook-translate-mcp = "ebook_translate.mcp:main"
 
 [tool.setuptools.packages.find]
 include = ["ebook_translate*"]

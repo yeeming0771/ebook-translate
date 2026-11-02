@@ -16,6 +16,7 @@ import tempfile
 from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile
+from . import __version__
 
 VERSION = 1
 XHTML = "http://www.w3.org/1999/xhtml"
@@ -474,7 +475,11 @@ def build(job, output, allow_image_pages=False):
         data = load(job)
         if any(b["status"] != "accepted" for b in data["batches"]):
             raise JobError("存在未验收批次，请先 import / approve；不得导出半成品")
-        image_pages = [w for w in data["warnings"] if w["code"] == "image_only"]
+        image_tasks = data.get("image_tasks", [])
+        if any(t["status"] != "accepted" for t in image_tasks):
+            raise JobError("存在未验收的图片识别/翻译任务")
+        reviewed_images = {t["document"]: t for t in image_tasks}
+        image_pages = [w for w in data["warnings"] if w["code"] == "image_only" and w["document"] not in reviewed_images]
         if image_pages and not allow_image_pages:
             raise JobError("存在未经 OCR 的纯图片页。复核为保留页后可使用 --allow-image-pages；报告会标记覆盖不完整")
         output = Path(output).resolve()
@@ -487,6 +492,17 @@ def build(job, output, allow_image_pages=False):
             raise JobError("导出文件必须放在任务目录之外")
         roots, changed = {}, set()
         with ZipFile(Path(job) / "source.epub") as source:
+            if image_tasks:
+                from . import vision
+                for task in image_tasks:
+                    vision.validate(task, json.dumps(task["translation"], ensure_ascii=False))
+                    if core_hash := task.get("source_hash"):
+                        if digest(source.read(task["document"])) != core_hash:
+                            raise JobError("图片文档源哈希发生变化")
+                    if task["translation"]["kind"] == "text":
+                        roots[task["document"]] = parse(source.read(task["document"]))
+                        vision.apply(roots[task["document"]], task["translation"]["translation_paragraphs"])
+                        changed.add(task["document"])
             for b in data["batches"]:
                 validate_response(b, json.dumps(b["translation"], ensure_ascii=False), data["target"])
                 for unit, translated in zip(b["units"], b["translation"]["items"]):
@@ -531,10 +547,14 @@ def build(job, output, allow_image_pages=False):
             finally:
                 if os.path.exists(temp_name):
                     os.unlink(temp_name)
-        report = {"version": "0.1.0", "created_at": now(), "source_hash": data["source_hash"],
+        report = {"version": __version__, "created_at": now(), "source_hash": data["source_hash"],
                   "output_hash": digest(output.read_bytes()), "target": data["target"],
                   "accepted_batches": len(data["batches"]), "translated_units": sum(len(b["units"]) for b in data["batches"]),
                   "text_units_accepted": True, "image_text_coverage_verified": not any(d["images"] for d in data["documents"]),
+                  "image_pages": [{"document": t["document"], "kind": t["translation"]["kind"],
+                                   "paragraphs": len(t["translation"]["translation_paragraphs"]),
+                                   "provenance": t["provenance"], "approval": t["approval"],
+                                   "layout_changed": t["translation"]["kind"] == "text"} for t in image_tasks],
                   "warnings": data["warnings"], "checks": {"xml": "passed", "resource_links_and_anchors": "passed", "zip_crc": "passed", "epubcheck": "not_run", "reader_visual_check": "not_run", "literary_quality": "not_automatically_certified"},
                   "batches": [{"id": b["id"], "document": b["document"], "provenance": b["provenance"], "warnings": b.get("warnings", []), "approval": b["approval"]} for b in data["batches"]]}
         atomic_json(report_path, report)

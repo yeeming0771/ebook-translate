@@ -13,6 +13,7 @@ def parser():
     p = argparse.ArgumentParser(description="免费的 Gemini 网页版 EPUB 翻译工作流")
     p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("mcp", help="启动供 Codex 调用的 stdio MCP 服务")
     init = sub.add_parser("init", help="清点 EPUB 并创建可恢复任务")
     init.add_argument("epub")
     init.add_argument("--job", required=True)
@@ -52,6 +53,9 @@ def main(argv=None):
     try:
         if args.command == "init":
             result = core.initialize(args.epub, args.job, args.target, args.max_chars)
+        elif args.command == "mcp":
+            from .mcp import main as mcp_main
+            return mcp_main()
         elif args.command == "status":
             result = core.status(args.job)
         elif args.command == "next":
