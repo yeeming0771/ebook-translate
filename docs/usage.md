@@ -73,6 +73,8 @@ ebook-translate approve "runs/book" b0001 --note "对照原文复核了人物称
 
 每次导入保存原始回复。错误回复将批次标记 `needs_revision`，不会被验收。重导入会撤销之前的验收；人工修改使用 `--provenance human-edit`。
 
+上述是 CLI 整批调试流程。v0.3.0 的 Codex Agent 经 MCP 自动保存有效条目、缩小失败请求并局部补译，见 [恢复协议](agent.md#自动缩批与局部修复v030)。已经进入局部修复的批次请继续用 MCP，CLI 整批 import 会拒绝覆盖其恢复状态。
+
 ### 恢复状态
 
 | 状态 | 下一步 |
@@ -107,7 +109,7 @@ ebook-translate build "runs/book" --output "outputs/book.zh.epub"
 - 保留属性值，暂不翻译 alt/title；非空此类文本会产生警告。XHTML head 标题与 EPUB 3 附带的旧式 NCX 不在翻译范围。
 - XML 序列化可能规范化命名空间前缀、引号及空标签写法；这是保留文档结构，不是字节相同或像素级复刻。
 - 数字警告允许人工确认合法的数字写法变化；结构通过不能证明没有语义漏译。
-- 本地工作台和 CLI 使用同一任务内核；不会调用付费服务。MCP 与独立浏览器扩展尚未实现。
+- 本地工作台、CLI 与 MCP 使用同一任务内核；不会调用付费服务。MCP 已实现，浏览器能力由 Codex 宿主提供。
 
 ## Skill 分发
 

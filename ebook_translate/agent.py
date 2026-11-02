@@ -4,7 +4,7 @@ from pathlib import Path
 import json
 import re
 
-from . import core, vision
+from . import core, vision, recovery
 
 
 def start(input_path, workspace, target="zh-CN", max_chars=6000):
@@ -31,6 +31,12 @@ def start(input_path, workspace, target="zh-CN", max_chars=6000):
 
 def next_action(job):
     data = core.load(job)
+    # Upgrade legacy failed batches and replay compatible archived replies once.
+    if not data.get('agent_pause'):
+        for failed in data['batches']:
+            if failed['status'] == 'needs_revision' and 'recovery' not in failed:
+                recovery.begin(job, failed['id'])
+        data = core.load(job)
     step = core.next_batch(job)
     all_tasks = data["batches"] + data.get("image_tasks", [])
     progress = {"accepted": sum(b["status"] == "accepted" for b in all_tasks), "total": len(all_tasks)}
@@ -62,9 +68,14 @@ def next_action(job):
     result.update(batch_id=b["id"], document=b["document"], status=b["status"])
     if b["status"] in {"pending", "needs_revision"}:
         errors = [a["error"] for a in b["attempts"] if "error" in a]
-        result.update(action="translate_in_gemini_web", prompt=core.prompt(job, b["id"]),
-                      last_error=errors[-1] if errors else None,
-                      instruction="用宿主浏览器将完整 prompt 提交 Gemini 网页；确认提交后调用 ebook_submitted。不要让用户复制粘贴。")
+        result['last_error'] = errors[-1] if errors else None
+        if 'recovery' in b:
+            result.update(recovery.plan(job, b['id']))
+            result['instruction'] = ('在新 Gemini 对话中仅补译 repair_unit_ids 指定条目；保留 request_id，不重发已通过项。收取后继续 ebook_receive。'
+                                     if result['action'] != 'blocked' else '已保存有效条目和原始回复，向用户报告单条连续失败的具体问题。')
+        else:
+            result.update(action='translate_in_gemini_web', prompt=core.prompt(job, b['id']),
+                          instruction='用宿主浏览器将完整 prompt 提交 Gemini 网页；确认提交后调用 ebook_submitted。不要让用户复制粘贴。')
     elif b["status"] == "submitted":
         result.update(action="collect_gemini_response", submissions=[a for a in b["attempts"] if a["event"] == "submitted"],
                       instruction="先查看保存的 Gemini 对话，等待可见生成完成并收取完整回复，调用 ebook_receive；不盲目重新发送。")
@@ -72,6 +83,7 @@ def next_action(job):
         result.update(action="review_translation", sources=b["units"], translation=b["translation"],
                       warnings=b.get("warnings", []),
                       instruction="Codex 对照原文复核。通过则调用 ebook_review 并写具体复核说明；有错则让 Gemini 修订，再 ebook_receive。无需用户逐批验收。")
+        result['instruction'] += ' 发现局部语义问题时调用 ebook_repair，只重译出错 ID。'
     return result
 
 
@@ -88,7 +100,13 @@ def receive(job, batch_id, response, provenance="gemini-web"):
         if batch_id.startswith("i"):
             vision.receive(job, batch_id, response, provenance)
         else:
-            core.import_response(job, batch_id, response, provenance)
+            data = core.load(job)
+            if 'recovery' in core.get_batch(data, batch_id):
+                result = recovery.receive(job, batch_id, response, provenance)
+                if 'validation_error' in result:
+                    return {**result, 'next': next_action(job)}
+            else:
+                core.import_response(job, batch_id, response, provenance)
     except core.JobError as exc:
         return {"validation_error": str(exc), "next": next_action(job)}
     return next_action(job)
@@ -99,6 +117,11 @@ def review(job, batch_id, note):
         vision.approve(job, batch_id, note)
     else:
         core.approve(job, batch_id, note)
+    return next_action(job)
+
+
+def repair(job, batch_id, unit_ids_json, reason):
+    recovery.request_repair(job, batch_id, json.loads(unit_ids_json), reason)
     return next_action(job)
 
 
@@ -116,6 +139,16 @@ def resume(job):
     with core.locked(job):
         data = core.load(job)
         data.pop("agent_pause", None)
+        for batch in data['batches']:
+            state = batch.get('recovery')
+            if not state or batch['status'] != 'needs_revision':
+                continue
+            exhausted = [identifier for identifier, count in state['single_failures'].items()
+                         if count >= recovery.MAX_SINGLE_FAILURES]
+            if exhausted:
+                state['history'].append({'event': 'retry_requested', 'unit_ids': exhausted, 'at': core.now()})
+                for identifier in exhausted:
+                    state['single_failures'].pop(identifier)
         core.save(job, data)
     return next_action(job)
 
