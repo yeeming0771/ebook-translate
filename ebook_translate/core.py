@@ -104,6 +104,22 @@ def slots(element):
         pieces.append(value or "")
 
     def visit(node):
+        if local(node) == 'ruby':
+            # Ruby's rb/span wrappers style a single lexical fragment. Exposing
+            # every wrapper as another token makes translation unnecessarily
+            # fragile. Keep the actual tree, map the whole base to its text
+            # slots, and leave rt/rp pronunciation untouched.
+            base_start = len(current)
+            def base(part):
+                if local(part) in {'rt', 'rp'}:
+                    return
+                text(part, 'text')
+                for child in part:
+                    base(child)
+                    text(child, 'tail')
+            base(node)
+            current[base_start:] = sorted(current[base_start:], key=lambda pair: not bool((getattr(pair[0], pair[1]) or '').strip()))
+            return
         text(node, "text")
         for child in node:
             boundary()
