@@ -1,0 +1,49 @@
+# Local secrets and browser sessions
+.env
+.env.*
+!.env.example
+credentials/
+secrets/
+.auth/
+.playwright/
+browser-profile/
+browser-profiles/
+storage-state*.json
+storageState*.json
+*.pem
+*.key
+
+# Books, translations, and run data
+*.epub
+*.mobi
+*.azw
+*.azw3
+*.pdf
+books/
+translations/
+data/
+runs/
+work/
+outputs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Python / Node build artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
