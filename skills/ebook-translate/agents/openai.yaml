@@ -1,0 +1,3 @@
+interface:
+  display_name: "Gemini 网页电子书翻译"
+  short_description: "通过免费的 Gemini 网页版逐批翻译 EPUB，支持断点恢复、对齐校验和保结构导出"

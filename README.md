@@ -10,11 +10,63 @@
 - Skill 负责浏览器操作、文学翻译要求、补译和异常恢复。
 - 小说原文、译文、电子书文件、浏览器凭据和运行记录不进入 Git。
 
-## 当前状态
+## 第一版 v0.1.0
 
-项目初始化与方案记录阶段。尚未实现可运行的 CLI、Skill 或 MCP 服务。
+已提供可运行的 Python CLI、本地网页工作台和 AI 助手 skill。无需模型 API key，运行时无第三方 Python 依赖。
 
-此前单书实验验证了整体流程，但脚本包含书籍专用映射，尚未迁移为通用实现。
+已实现：EPUB 3 全 manifest XHTML 清点、稳定 ID、内联标签保护、原文哈希校验、逐批状态和断点恢复、原始回复归档、对照验收、保结构回填、资源与锚点检查、ZIP 检查及报告。
+
+## 快速开始
+
+需要 Python 3.11+：
+
+```sh
+python -m pip install -e .
+ebook-translate init "D:/books/book.epub" --job "runs/book" --target zh-CN
+ebook-translate serve "runs/book"
+```
+
+打开 `http://127.0.0.1:8765/`：选择批次 → 将提示词发给 Gemini 网页 → 记录提交 → 收取完整 JSON 回复 → 保存校验 → 对照原文复核并验收。
+
+全部文本批次验收后：
+
+```sh
+ebook-translate build "runs/book" --output "outputs/book.zh.epub"
+```
+
+同时生成 `book.zh.report.json`，记录处理数量、来源、复核说明与未执行检查。
+
+不安装时，可在仓库根目录用 `python -m ebook_translate` 替代 `ebook-translate`。原创微型书籍试用：
+
+Windows 也可直接运行 `.\ebook-translate.cmd`，无需配置 Python Scripts 的 PATH。
+
+```sh
+python examples/create_demo.py --output "work/demo.epub"
+python -m ebook_translate init "work/demo.epub" --job "runs/demo"
+python -m ebook_translate serve "runs/demo"
+```
+
+## Gemini 网页 Skill
+
+随仓库分发：[skills/ebook-translate/SKILL.md](skills/ebook-translate/SKILL.md)。将该文件夹复制到宿主 skills 目录并安装 CLI，即可让有浏览器控制能力的助手操作翻译循环。
+
+CLI 不自行接管浏览器，skill 不自带浏览器驱动；Gemini 额度限制或登录中断时保存进度，不切换付费服务。
+
+## 第一版边界
+
+支持无加密的可重排 EPUB 3，不支持 EPUB 2、固定版式和扫描页 OCR。纯图片页默认阻止导出；确认保留时可用 `--allow-image-pages`，报告仍标明覆盖未验证。
+
+保结构不等于像素级复刻：XML 写法可能规范化，ruby 原注音、图形、代码和属性文本需复核。文学质量需对照原文判断，EPUBCheck 和视觉检查未执行时不会报告为通过。
+
+完整命令与限制见 [使用说明](docs/usage.md)。
+
+## 开发验证
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+集成测试使用原创合成 EPUB 和确定性测试回复，不调用外部模型，不代表已完成真实 Gemini 长任务兼容性测试。
 
 ## 预期工作流
 
