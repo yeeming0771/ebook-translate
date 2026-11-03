@@ -9,9 +9,28 @@ import json
 from pathlib import Path
 import re
 
-from . import core
+from . import core, wire
 
 MAX_SINGLE_FAILURES = 3
+MAX_SEMANTIC_REPAIRS = 3
+
+
+def semantic_rounds(state):
+    if 'semantic_rounds' not in state:
+        state['semantic_rounds'] = dict(Counter(identifier for event in state['history']
+                                                if event['event'] == 'semantic_repair_requested'
+                                                for identifier in event['unit_ids']))
+    return state['semantic_rounds']
+
+
+def semantic_issues(state):
+    if 'semantic_issues' not in state:
+        state['semantic_issues'] = {}
+        for event in state['history']:
+            if event['event'] in {'semantic_repair_requested', 'semantic_repair_blocked'}:
+                for identifier in event['unit_ids']:
+                    state['semantic_issues'][identifier] = (event.get('reasons') or {}).get(identifier, event['reason'])
+    return state['semantic_issues']
 
 
 def decoded_items(raw, batch_id):
@@ -103,14 +122,18 @@ def retain(batch, raw, target, event, scope, request_id=None):
             continue
         item = next(it for it in items if isinstance(it, dict) and it.get('id') == identifier)
         try:
+            if event.get('codec') == wire.SLOTS:
+                item = wire.materialize(originals[identifier], item)
             core.validate_response({'id': batch['id'], 'units': [originals[identifier]]},
                                    json.dumps({'batch_id': batch['id'], 'items': [item]}, ensure_ascii=False), target)
         except core.JobError as exc:
             errors[identifier] = str(exc)
             continue
-        # Canonical keys only; translation is copied byte-for-byte as a string.
+        # Slot text is copied unchanged; only original format boundaries are inserted.
         state['candidates'][identifier] = {k: item[k] for k in ('id', 'source_hash', 'translation')}
         state['item_sources'][identifier] = {'raw_file': event['raw_file'], 'provenance': event['provenance']}
+        if event.get('codec'):
+            state['item_sources'][identifier]['codec'] = event['codec']
         retained.add(identifier)
     return retained, errors, parse_mode
 
@@ -156,32 +179,52 @@ def plan(job, batch_id):
         batch = core.get_batch(data, batch_id)
         state = batch['recovery']
         unresolved = [u for u in batch['units'] if u['id'] not in state['candidates']]
+        semantic_issues(state)
+        if state.get('semantic_blocked'):
+            return {'action': 'blocked', 'reason': '同一条目经三轮语义修订仍未通过复核，保留进度',
+                    'unit_ids': state['semantic_blocked'],
+                    'errors': {identifier: state['errors'].get(identifier) for identifier in state['semantic_blocked']}}
         exhausted = [u['id'] for u in unresolved if state['single_failures'].get(u['id'], 0) >= MAX_SINGLE_FAILURES]
         if exhausted:
             return {'action': 'blocked', 'reason': '单条局部补译连续失败，保留进度', 'unit_ids': exhausted,
                     'errors': {identifier: state['errors'].get(identifier) for identifier in exhausted}}
         if not unresolved:
             raise core.JobError('没有待修复条目')
+        # Upgrade only an unsent legacy request. Submitted work must be collected
+        # with its original protocol and conversation, never silently replaced.
+        if 'request' in state and 'codec' not in state['request'] and batch['status'] != 'submitted':
+            state['history'].append({'event': 'protocol_upgrade', 'request_id': state['request']['id'], 'at': core.now()})
+            state.pop('request')
         if 'request' not in state:
             selected = unresolved[:state['limit']]
             state['serial'] += 1
-            fingerprint = core.digest(json.dumps([(u['id'], u['source_hash']) for u in selected]).encode())[:12]
+            codec = wire.SLOTS if any(core.TOKEN.search(u['source']) for u in selected) else 'items-v1'
+            fingerprint = core.digest(json.dumps([codec, [(u['id'], u['source_hash']) for u in selected]]).encode())[:12]
             state['request'] = {'id': f"{batch_id}-r{state['serial']:04d}-{fingerprint}",
-                                'unit_ids': [u['id'] for u in selected], 'created_at': core.now()}
+                                'unit_ids': [u['id'] for u in selected], 'codec': codec, 'created_at': core.now()}
             core.save(job, data)
         request = state['request']
         units = [u for u in batch['units'] if u['id'] in request['unit_ids']]
         subset = dict(batch, units=units)
-        prompt = core.render_prompt(data, subset, request['id'])
+        issues = {u['id']: state['semantic_issues'].get(u['id'], state['errors'].get(u['id'], '尚未取得有效译文')) for u in units}
+        prompt = (wire.prompt(data, subset, request['id'], issues) if request.get('codec') == wire.SLOTS
+                  else core.render_prompt(data, subset, request['id']))
         prompt += ('\n这是局部修复请求，只返回本次列出的条目，不得重发整批或已通过条目。'
                    f"\n输出 JSON 顶层字段顺序必须为 batch_id、request_id、items，其中 request_id={json.dumps(request['id'])}。"
-                   '\n待修复问题：' + json.dumps({u['id']: state['errors'].get(u['id'], '尚未取得有效译文') for u in units}, ensure_ascii=False))
+                   '\n待修复问题：' + json.dumps(issues, ensure_ascii=False))
+        format_issues = {u['id']: state.get('format_errors', {}).get(u['id']) for u in units
+                         if state.get('format_errors', {}).get(u['id'])}
+        if format_issues:
+            prompt += '\n上次回复的结构错误（本次按当前协议纠正）：' + json.dumps(format_issues, ensure_ascii=False)
         # Nearby source helps translation of isolated sentences; not output items.
         indexes = [i for i, u in enumerate(batch['units']) if u['id'] in request['unit_ids']]
-        context = [batch['units'][i]['source'][:500] for i in sorted({min(indexes)-1, max(indexes)+1})
+        neighbors = sorted({index + offset for index in indexes for offset in (-1, 1)})
+        context = [{'id': batch['units'][i]['id'], 'source': core.TOKEN.sub('', batch['units'][i]['source'])[:500]}
+                   for i in neighbors
                    if 0 <= i < len(batch['units']) and batch['units'][i]['id'] not in request['unit_ids']]
         prompt += '\n相邻原文仅供语境，不要输出：' + json.dumps(context, ensure_ascii=False)
         return {'action': 'translate_in_gemini_web', 'prompt': prompt, 'request_id': request['id'],
+                'response_codec': request.get('codec', 'items-v1'),
                 'repair_unit_ids': request['unit_ids'], 'retained_items': len(state['candidates']),
                 'remaining_items': len(unresolved), 'fresh_conversation': True}
 
@@ -200,6 +243,8 @@ def receive(job, batch_id, raw, provenance):
         (Path(job) / 'responses' / name).write_text(raw, encoding='utf-8')
         event = {'event': 'import', 'at': core.now(), 'raw_file': f'responses/{name}',
                  'provenance': provenance, 'request_id': request['id'], 'unit_ids': request['unit_ids']}
+        if request.get('codec'):
+            event['codec'] = request['codec']
         retained, errors, mode = retain(batch, raw, data['target'], event, request['unit_ids'], request['id'])
         event.update(parse_mode=mode, retained=sorted(retained), errors=errors)
         if errors:
@@ -216,7 +261,11 @@ def receive(job, batch_id, raw, provenance):
             if len(request['unit_ids']) == 1:
                 identifier = request['unit_ids'][0]
                 state['single_failures'][identifier] = state['single_failures'].get(identifier, 0) + 1
-        state['errors'].update(errors)
+        # Keep semantic findings separate from transport/format errors.
+        state.setdefault('format_errors', {}).update(errors)
+        for identifier in errors:
+            if identifier not in state.get('semantic_issues', {}):
+                state['errors'][identifier] = errors[identifier]
         state['history'].append({'event': 'repair', 'request_id': request['id'], 'retained': sorted(retained),
                                  'failed': sorted(failed), 'next_limit': state['limit'], 'raw_file': event['raw_file']})
         state.pop('request')
@@ -225,11 +274,14 @@ def receive(job, batch_id, raw, provenance):
         return {'assembled': assembled, 'retained': len(retained), 'failed': sorted(failed)}
 
 
-def request_repair(job, batch_id, unit_ids, reason):
+def request_repair(job, batch_id, unit_ids, reason, reasons=None):
     if not isinstance(unit_ids, list) or not unit_ids or not all(isinstance(x, str) for x in unit_ids) or len(set(unit_ids)) != len(unit_ids):
         raise core.JobError('unit_ids 必须是非空且不重复的 ID 数组')
     if not reason.strip():
         raise core.JobError('必须记录局部修复原因')
+    if reasons is not None and (not isinstance(reasons, dict) or set(reasons) != set(unit_ids)
+                               or not all(isinstance(value, str) and value.strip() for value in reasons.values())):
+        raise core.JobError('逐项原因必须完整对应指定 ID，且每项为非空字符串')
     with core.locked(job):
         data = core.load(job)
         batch = core.get_batch(data, batch_id)
@@ -243,14 +295,23 @@ def request_repair(job, batch_id, unit_ids, reason):
                                  'item_sources': {it['id']: {'raw_file': event['raw_file'], 'provenance': batch['provenance']} for it in batch['translation']['items']},
                                  'serial': 0, 'single_failures': {}, 'errors': {}, 'history': []}
         state = batch['recovery']
+        semantic_issues(state)
+        rounds = semantic_rounds(state)
+        exhausted = [identifier for identifier in unit_ids if rounds.get(identifier, 0) >= MAX_SEMANTIC_REPAIRS]
         state.pop('request', None)
         for identifier in unit_ids:
             state['candidates'].pop(identifier, None)
             state['item_sources'].pop(identifier, None)
-            state['errors'][identifier] = reason
+            state['errors'][identifier] = reasons[identifier] if reasons is not None else reason
+            state.setdefault('semantic_issues', {})[identifier] = state['errors'][identifier]
+            state.get('format_errors', {}).pop(identifier, None)
             state['single_failures'].pop(identifier, None)
+            if identifier not in exhausted:
+                rounds[identifier] = rounds.get(identifier, 0) + 1
         state['limit'] = min(3, len(unit_ids))
-        state['history'].append({'event': 'semantic_repair_requested', 'unit_ids': unit_ids, 'reason': reason, 'at': core.now()})
+        state['semantic_blocked'] = exhausted
+        state['history'].append({'event': 'semantic_repair_blocked' if exhausted else 'semantic_repair_requested',
+                                 'unit_ids': unit_ids, 'reason': reason, 'reasons': reasons, 'at': core.now()})
         batch.update(status='needs_revision', translation=None)
         batch.pop('approval', None)
         core.save(job, data)

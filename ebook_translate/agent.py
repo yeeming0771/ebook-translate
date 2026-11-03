@@ -4,7 +4,7 @@ from pathlib import Path
 import json
 import re
 
-from . import core, vision, recovery
+from . import core, vision, recovery, wire
 
 
 def start(input_path, workspace, target="zh-CN", max_chars=6000):
@@ -82,8 +82,10 @@ def next_action(job):
     else:
         result.update(action="review_translation", sources=b["units"], translation=b["translation"],
                       warnings=b.get("warnings", []),
-                      instruction="Codex 对照原文复核。通过则调用 ebook_review 并写具体复核说明；有错则让 Gemini 修订，再 ebook_receive。无需用户逐批验收。")
-        result['instruction'] += ' 发现局部语义问题时调用 ebook_repair，只重译出错 ID。'
+                      instruction="Codex 对照原文逐句复核，slot_review 中各位置的译文须对应原文。通过则调用 ebook_review 并写具体说明；有错调用 ebook_repair 并填写逐项原因。无需用户逐批验收。")
+        origins = b.get('recovery', {}).get('item_sources', {})
+        result['slot_review'] = [wire.review(unit, item) for unit, item in zip(b['units'], b['translation']['items'])
+                                 if origins.get(unit['id'], {}).get('codec') == wire.SLOTS]
     return result
 
 
@@ -120,8 +122,9 @@ def review(job, batch_id, note):
     return next_action(job)
 
 
-def repair(job, batch_id, unit_ids_json, reason):
-    recovery.request_repair(job, batch_id, json.loads(unit_ids_json), reason)
+def repair(job, batch_id, unit_ids_json, reason, reasons_json=None):
+    recovery.request_repair(job, batch_id, json.loads(unit_ids_json), reason,
+                            json.loads(reasons_json) if reasons_json is not None else None)
     return next_action(job)
 
 
@@ -143,6 +146,10 @@ def resume(job):
             state = batch.get('recovery')
             if not state or batch['status'] != 'needs_revision':
                 continue
+            for identifier in state.pop('semantic_blocked', []):
+                # The reopened request is the first round of the new budget.
+                recovery.semantic_rounds(state)[identifier] = 1
+                state['history'].append({'event': 'semantic_retry_requested', 'unit_ids': [identifier], 'at': core.now()})
             exhausted = [identifier for identifier, count in state['single_failures'].items()
                          if count >= recovery.MAX_SINGLE_FAILURES]
             if exhausted:

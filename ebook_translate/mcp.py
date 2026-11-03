@@ -21,7 +21,7 @@ TOOLS = [
     ("ebook_submitted", "仅在宿主浏览器确认 Gemini 已收到请求后记录提交与对话地址。", schema({"job": JOB, "batch_id": STRING, "conversation": STRING}, ["job", "batch_id"]), agent.submitted),
     ("ebook_receive", "将宿主浏览器实际读取的完整 Gemini 回复直接落盘、校验，并返回下一步。不要伪造回复。", schema({"job": JOB, "batch_id": STRING, "response": STRING, "provenance": {"type": "string", "enum": ["gemini-web", "human-edit"], "default": "gemini-web"}}, ["job", "batch_id", "response"]), agent.receive),
     ("ebook_review", "Codex 对照原译文复核后验收当前批次，记录具体说明并返回下一步，不要求用户验收每批。", schema({"job": JOB, "batch_id": STRING, "note": STRING}, ["job", "batch_id", "note"]), agent.review),
-    ("ebook_repair", "对待复核批次仅补译指定出错条目，其他译文保留。失败时自动缩小修复请求。", schema({"job": JOB, "batch_id": STRING, "unit_ids_json": {"type": "string", "description": "需要重译的 ID 数组 JSON 文本"}, "reason": STRING}, ['job', 'batch_id', 'unit_ids_json', 'reason']), agent.repair),
+    ("ebook_repair", "对待复核批次仅补译指定出错条目，其他译文保留。同一条目最多三轮语义修订。", schema({"job": JOB, "batch_id": STRING, "unit_ids_json": {"type": "string", "description": "需要重译的 ID 数组 JSON 文本"}, "reason": STRING, "reasons_json": {"type": "string", "description": "可选，逐项 ID 到具体修复原因的 JSON 对象，须覆盖全部指定 ID"}}, ['job', 'batch_id', 'unit_ids_json', 'reason']), agent.repair),
     ("ebook_finish", "全部批次完成后导出 EPUB 和报告，返回交付路径；不允许静默跳过扫描页。", schema({"job": JOB}, ["job"]), agent.finish),
     ("ebook_pause", "遇到登录、验证码、额度等外部阻碍时记录并交接；不切换付费模型。", schema({"job": JOB, "reason": STRING}, ["job", "reason"]), agent.pause),
     ("ebook_resume", "外部阻碍解除后清除阻碍标记，恢复原任务。", schema({"job": JOB}, ["job"]), agent.resume),

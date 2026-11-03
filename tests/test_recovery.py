@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from zipfile import ZipFile
 
-from ebook_translate import agent, core, mcp
+from ebook_translate import agent, core, mcp, wire
 from test_workflow import fixture
 
 
@@ -35,8 +35,13 @@ class RecoveryTests(unittest.TestCase):
         return agent.receive(self.job, self.batch['id'], json.dumps({'batch_id': self.batch['id'], 'items': items}, ensure_ascii=False))
 
     def response(self, step, items=None):
+        items = copy.deepcopy(self.items(step['repair_unit_ids']) if items is None else items)
+        if step.get('response_codec') == wire.SLOTS:
+            for item in items:
+                chunks = core.TOKEN.split(item.pop('translation'))
+                item['parts'] = [{'id': f'p{index:03d}', 'translation': text} for index, text in enumerate(chunks, 1)]
         return json.dumps({'batch_id': self.batch['id'], 'request_id': step['request_id'],
-                           'items': self.items(step['repair_unit_ids']) if items is None else items}, ensure_ascii=False)
+                           'items': items}, ensure_ascii=False)
 
     def next(self):
         return agent.next_action(self.job)
@@ -168,10 +173,94 @@ class RecoveryTests(unittest.TestCase):
                 agent.repair(self.job, 'b0001', json.dumps(ids), 'bad request')
             self.assertEqual(core.load(self.job), previous)
 
+    def test_semantic_rejection_budget_is_per_unit_and_requires_explicit_resume(self):
+        self.initial(self.items())
+        identifier = self.items()[2]['id']
+        for _ in range(3):
+            step = agent.repair(self.job, 'b0001', json.dumps([identifier]), '否定含义不准确')
+            self.assertEqual(step['action'], 'translate_in_gemini_web')
+            self.assertEqual(agent.receive(self.job, 'b0001', self.response(step))['action'], 'review_translation')
+        blocked = agent.repair(self.job, 'b0001', json.dumps([identifier]), '依然漏掉否定')
+        self.assertEqual(blocked['action'], 'blocked')
+        self.assertEqual(blocked['unit_ids'], [identifier])
+        with self.assertRaises(core.JobError):
+            agent.review(self.job, 'b0001', '不能绕过被拒绝的内容')
+        resumed = agent.resume(self.job)
+        self.assertEqual(resumed['action'], 'translate_in_gemini_web')
+        state = core.load(self.job)['batches'][0]['recovery']
+        self.assertEqual(state['semantic_rounds'][identifier], 1)
+        self.assertEqual(len(state['candidates']), 9)
+
+    def test_per_item_issues_survive_format_failure_without_cross_contamination(self):
+        self.initial(self.items())
+        ids = [self.items()[2]['id'], self.items()[3]['id']]
+        reasons = {ids[0]: '否定漏译', ids[1]: '时间顺序颠倒'}
+        step = agent.repair(self.job, 'b0001', json.dumps(ids), '逐项问题', json.dumps(reasons))
+        agent.receive(self.job, 'b0001', '{broken')
+        again = self.next()
+        self.assertIn('否定漏译', again['prompt'])
+        self.assertIn('request_id', again['prompt'])
+        self.assertTrue(core.load(self.job)['batches'][0]['recovery']['format_errors'])
+        self.assertNotIn('时间顺序颠倒', again['prompt'])
+        self.assertEqual(core.load(self.job)['batches'][0]['recovery']['semantic_issues'], reasons)
+
+    def test_blocked_group_does_not_give_another_unit_an_extra_round(self):
+        self.initial(self.items())
+        first, second = [item['id'] for item in self.items()[2:4]]
+        for identifier, count in ((first, 3), (second, 2)):
+            for _ in range(count):
+                step = agent.repair(self.job, 'b0001', json.dumps([identifier]), '合成夹具复核未通过')
+                agent.receive(self.job, 'b0001', self.response(step))
+        blocked = agent.repair(self.job, 'b0001', json.dumps([first, second]), '两条依然未通过')
+        self.assertEqual(blocked['action'], 'blocked')
+        self.assertEqual(blocked['unit_ids'], [first])
+        state = core.load(self.job)['batches'][0]['recovery']
+        self.assertEqual(state['semantic_rounds'][second], 3)
+        self.assertNotIn(second, state['candidates'])
+        resumed = agent.resume(self.job)
+        agent.receive(self.job, 'b0001', self.response(resumed))
+        self.assertEqual(agent.repair(self.job, 'b0001', json.dumps([second]), '仍需修订')['action'], 'blocked')
+
+    def test_submitted_legacy_request_keeps_original_protocol_until_collected(self):
+        self.initial([])
+        with core.locked(self.job):
+            data = core.load(self.job)
+            b = data['batches'][0]
+            b['recovery']['request'].pop('codec')
+            b['status'] = 'submitted'
+            core.save(self.job, data)
+        action = self.next()
+        self.assertEqual(action['action'], 'collect_gemini_response')
+        state = core.load(self.job)['batches'][0]['recovery']
+        old_id = state['request']['id']
+        raw = json.dumps({'batch_id': 'b0001', 'request_id': old_id, 'items': self.items(state['request']['unit_ids'])})
+        agent.receive(self.job, 'b0001', raw)
+        self.assertEqual(self.next()['retained_items'], 5)
+
+    def test_unsent_legacy_request_upgrades_and_rejects_its_late_reply(self):
+        self.initial([])
+        with core.locked(self.job):
+            data = core.load(self.job)
+            state = data['batches'][0]['recovery']
+            state['request'].pop('codec')
+            old_id = state['request']['id']
+            core.save(self.job, data)
+        upgraded = self.next()
+        self.assertNotEqual(upgraded['request_id'], old_id)
+        self.assertEqual(upgraded['response_codec'], wire.SLOTS)
+        before = core.load(self.job)['batches'][0]['recovery']['single_failures']
+        late = json.dumps({'batch_id': 'b0001', 'request_id': old_id, 'items': self.items()})
+        self.assertIn('validation_error', agent.receive(self.job, 'b0001', late))
+        self.assertEqual(core.load(self.job)['batches'][0]['recovery']['single_failures'], before)
+        self.assertEqual(self.next()['request_id'], upgraded['request_id'])
+
     def test_repaired_batch_exports_once_with_per_item_sources(self):
-        self.initial(self.items()[:9])
+        self.initial(self.items()[:1] + self.items()[2:])
         step = self.next()
-        agent.receive(self.job, 'b0001', self.response(step))
+        self.assertEqual(step['response_codec'], wire.SLOTS)
+        review = agent.receive(self.job, 'b0001', self.response(step))
+        self.assertEqual(review['slot_review'][0]['unit_id'], self.items()[1]['id'])
+        self.assertTrue(all('source' in part and 'translation' in part for part in review['slot_review'][0]['parts']))
         agent.review(self.job, 'b0001', '合成夹具逐项核对修复结果')
         for b in core.load(self.job)['batches'][1:]:
             raw = {'batch_id': b['id'], 'items': [{'id': u['id'], 'source_hash': u['source_hash'], 'translation': u['source'].replace('文', '译')} for u in b['units']]}
@@ -181,6 +270,7 @@ class RecoveryTests(unittest.TestCase):
         report = json.loads(Path(result['report']).read_text(encoding='utf-8'))
         recovered = report['batches'][0]['recovery']
         self.assertEqual(len(recovered['item_sources']), 10)
+        self.assertEqual(recovered['item_sources'][self.items()[1]['id']]['codec'], wire.SLOTS)
         self.assertEqual(report['translated_units'], 14)
         self.assertTrue(all((Path(self.job)/entry['raw_file']).is_file() for entry in recovered['item_sources'].values()))
 
